@@ -344,8 +344,9 @@ func resourceGrant() *schema.Resource {
 
 			"database": {
 				Type:     schema.TypeString,
-				Required: true,
+				Optional: true,
 				ForceNew: true,
+				Default:  "*",
 			},
 
 			"table": {
