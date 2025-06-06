@@ -660,7 +660,7 @@ func isNonExistingGrant(err error) bool {
 }
 
 func ImportGrant(ctx context.Context, d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
-	userHostDatabaseTable := strings.Split(d.Id(), "@")
+	userHostDatabaseTable := strings.Split(strings.TrimSuffix(d.Id(), ";r"), "@")
 
 	if len(userHostDatabaseTable) != 4 && len(userHostDatabaseTable) != 5 {
 		return nil, fmt.Errorf("wrong ID format %s - expected user@host@database@table (and optionally ending @ to signify grant option) where some parts can be empty)", d.Id())
@@ -676,11 +676,19 @@ func ImportGrant(ctx context.Context, d *schema.ResourceData, meta interface{}) 
 		Host: host,
 	}
 
-	desiredGrant := &TablePrivilegeGrant{
-		Database:   database,
-		Table:      table,
-		Grant:      grantOption,
-		UserOrRole: userOrRole,
+	var desiredGrant MySQLGrant
+	if strings.HasSuffix(d.Id(), ";r") {
+		desiredGrant = &RoleGrant{
+			UserOrRole: userOrRole,
+			Grant:      grantOption,
+		}
+	} else {
+		desiredGrant = &TablePrivilegeGrant{
+			Database:   database,
+			Table:      table,
+			Grant:      grantOption,
+			UserOrRole: userOrRole,
+		}
 	}
 
 	db, err := getDatabaseFromMeta(ctx, meta)
@@ -696,6 +704,15 @@ func ImportGrant(ctx context.Context, d *schema.ResourceData, meta interface{}) 
 		if foundGrant.ConflictsWithGrant(desiredGrant) {
 			res := resourceGrant().Data(nil)
 			setDataFromGrant(foundGrant, res)
+			if _, ok := desiredGrant.(*RoleGrant); ok {
+				/*
+					Import database and table for role grants literally for backwards compatibility.
+					Role grants do not have a database or table, but we still set them here to avoid
+					making existing resources to "force replacement".
+				*/
+				res.Set("database", database)
+				res.Set("table", table)
+			}
 			return []*schema.ResourceData{res}, nil
 		}
 	}
