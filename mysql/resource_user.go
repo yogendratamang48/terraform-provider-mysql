@@ -168,8 +168,26 @@ func CreateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 			if authStm == "" {
 				return diag.Errorf("auth_string_hashed is not supported for auth plugin %s", auth)
 			}
-			authStm = fmt.Sprintf("%s AS ?", authStm)
+			if auth == "caching_sha2_password" {
+				// hashed should be converted to hex
+				authStm = fmt.Sprintf("%s AS %s", authStm, hashed)
+
+			} else {
+				authStm = fmt.Sprintf("%s AS ?", authStm)
+			}
+
 		}
+	}
+
+	// Validate user and host to prevent SQL injection
+	user := d.Get("user").(string)
+	host := d.Get("host").(string)
+
+	if err := validateIdentifier(user); err != nil {
+		return diag.Errorf("invalid user name: %v", err)
+	}
+	if err := validateIdentifier(host); err != nil {
+		return diag.Errorf("invalid host name: %v", err)
 	}
 
 	var stmtSQL string
@@ -179,16 +197,16 @@ func CreateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 		var aadIdentity = d.Get("aad_identity").(*schema.Set).List()[0].(map[string]interface{})
 		if aadIdentity["type"].(string) == "service_principal" {
 			// CREATE AADUSER 'mysqlProtocolLoginName"@"mysqlHostRestriction' IDENTIFIED BY 'identityId'
-			stmtSQL = "CREATE AADUSER ?@? IDENTIFIED BY ?"
-			args = []interface{}{d.Get("user").(string), d.Get("host").(string), aadIdentity["identity"].(string)}
+			stmtSQL = fmt.Sprintf("CREATE AADUSER `%s`@`%s` IDENTIFIED BY ?", user, host)
+			args = []interface{}{aadIdentity["identity"].(string)}
 		} else {
 			// CREATE AADUSER 'identityName"@"mysqlHostRestriction' AS 'mysqlProtocolLoginName'
-			stmtSQL = "CREATE AADUSER ?@? AS ?"
-			args = []interface{}{aadIdentity["identity"].(string), d.Get("host").(string), d.Get("user").(string)}
+			stmtSQL = fmt.Sprintf("CREATE AADUSER `%s`@`%s` AS ?", aadIdentity["identity"].(string), host)
+			args = []interface{}{user}
 		}
 	} else {
-		stmtSQL = "CREATE USER ?@?"
-		args = []interface{}{d.Get("user").(string), d.Get("host").(string)}
+		stmtSQL = fmt.Sprintf("CREATE USER `%s`@`%s`", user, host)
+		args = []interface{}{}
 	}
 
 	var password string
@@ -198,14 +216,16 @@ func CreateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 		password = d.Get("password").(string)
 	}
 
-	if auth == "AWSAuthenticationPlugin" && d.Get("host").(string) == "localhost" {
+	if auth == "AWSAuthenticationPlugin" && host == "localhost" {
 		return diag.Errorf("cannot use IAM auth against localhost")
 	}
 
 	if authStm != "" {
 		stmtSQL += authStm
 		if hashed != "" {
-			args = append(args, hashed)
+			if auth != "caching_sha2_password" {
+				args = append(args, hashed)
+			}
 		}
 		if password != "" {
 			stmtSQL += " BY ?"
@@ -222,8 +242,8 @@ func CreateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 
 	if getVersionFromMeta(ctx, meta).GreaterThan(requiredVersion) && d.Get("tls_option").(string) != "" {
 		if createObj == "AADUSER" {
-			updateStmtSql = "ALTER USER ?@? REQUIRE " + d.Get("tls_option").(string)
-			updateArgs = []interface{}{d.Get("user").(string), d.Get("host").(string)}
+			updateStmtSql = fmt.Sprintf("ALTER USER `%s`@`%s` REQUIRE %s", user, host, d.Get("tls_option").(string))
+			updateArgs = []interface{}{}
 		} else {
 			stmtSQL += " REQUIRE " + d.Get("tls_option").(string)
 		}
@@ -232,7 +252,7 @@ func CreateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 	// Redact sensitive values in args for logging
 	redactedArgs := make([]interface{}, len(args))
 	for i, arg := range args {
-		if (password != "" && arg == password) || (hashed != "" && arg == hashed) {
+		if (password != "" && arg == password) || (hashed != "" && arg == hashed && auth != "caching_sha2_password") {
 			redactedArgs[i] = "<SENSITIVE>"
 		} else {
 			redactedArgs[i] = arg
@@ -246,8 +266,8 @@ func CreateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 		return diag.Errorf("failed executing SQL: %v", err)
 	}
 
-	user := fmt.Sprintf("%s@%s", d.Get("user").(string), d.Get("host").(string))
-	d.SetId(user)
+	user_id := fmt.Sprintf("%s@%s", user, host)
+	d.SetId(user_id)
 
 	if updateStmtSql != "" {
 		log.Println("[DEBUG] Executing statement:", updateStmtSql, "args:", updateArgs)
@@ -288,10 +308,13 @@ func UpdateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 	if len(auth) > 0 {
 		if d.HasChange("tls_option") || d.HasChange("auth_plugin") || d.HasChange("auth_string_hashed") {
 			var stmtSQL string
-
 			authString := ""
 			if d.Get("auth_string_hashed").(string) != "" {
 				authString = fmt.Sprintf("IDENTIFIED WITH %s AS '%s'", d.Get("auth_plugin"), d.Get("auth_string_hashed"))
+				// for caching_sha2_password we need in hex format
+				if auth == "caching_sha2_password" {
+					authString = fmt.Sprintf("IDENTIFIED WITH %s AS %s", d.Get("auth_plugin"), d.Get("auth_string_hashed"))
+				}
 			}
 			stmtSQL = fmt.Sprintf("ALTER USER '%s'@'%s' %s  REQUIRE %s",
 				d.Get("user").(string),
@@ -526,4 +549,21 @@ func NewEmptyStringSuppressFunc(k, old, new string, d *schema.ResourceData) bool
 	}
 
 	return false
+}
+
+// validateIdentifier validates MySQL identifiers to prevent SQL injection
+func validateIdentifier(identifier string) error {
+	if len(identifier) == 0 {
+		return fmt.Errorf("identifier cannot be empty")
+	}
+	if len(identifier) > 64 {
+		return fmt.Errorf("identifier too long (max 64 characters)")
+	}
+
+	// Check for backticks which could break our quoting
+	if strings.Contains(identifier, "`") {
+		return fmt.Errorf("identifier cannot contain backticks")
+	}
+
+	return nil
 }
