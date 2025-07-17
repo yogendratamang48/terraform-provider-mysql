@@ -423,11 +423,13 @@ func ReadUser(ctx context.Context, d *schema.ResourceData, meta interface{}) dia
 	}
 	requiredVersion, _ := version.NewVersion("5.7.0")
 	if getVersionFromMeta(ctx, meta).GreaterThan(requiredVersion) {
-
-		_, err := db.ExecContext(ctx, "SET print_identified_with_as_hex = ON")
-		if err != nil {
-			// return diag.Errorf("failed setting print_identified_with_as_hex: %v", err)
-			log.Printf("[DEBUG] Could not set print_identified_with_as_hex: %v", err)
+		// Skip setting print_identified_with_as_hex if auth_plugin is aad_auth
+		if d.Get("auth_plugin") != "aad_auth" {
+			_, err := db.ExecContext(ctx, "SET print_identified_with_as_hex = ON")
+			if err != nil {
+				// return diag.Errorf("failed setting print_identified_with_as_hex: %v", err)
+				log.Printf("[DEBUG] Could not set print_identified_with_as_hex: %v", err)
+			}
 		}
 		stmt := "SHOW CREATE USER ?@?"
 		var createUserStmt string
@@ -445,6 +447,7 @@ func ReadUser(ctx context.Context, d *schema.ResourceData, meta interface{}) dia
 		// CREATE USER `jdoe-tf-test-47`@`example.com` IDENTIFIED WITH 'caching_sha2_password' REQUIRE NONE PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK PASSWORD HISTORY DEFAULT PASSWORD REUSE INTERVAL DEFAULT PASSWORD REQUIRE CURRENT DEFAULT
 		// CREATE USER `jdoe`@`example.com` IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$i`xay#fG/\' TrbkNA82' REQUIRE NONE PASSWORD
 		// CREATE USER `hashed_hex`@`localhost` IDENTIFIED WITH 'caching_sha2_password' AS 0x244124303035242522434C16580334755221766C29210D2C415E033550367655494F314864686775414E735A742E6F474857504B623172525066574D524F30506B7A79646F30 REQUIRE NONE PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK PASSWORD HISTORY DEFAULT PASSWORD REUSE INTERVAL DEFAULT PASSWORD REQUIRE CURRENT DEFAULT
+
 		re := regexp.MustCompile("^CREATE USER ['`]([^'`]*)['`]@['`]([^'`]*)['`] IDENTIFIED WITH ['`]([^'`]*)['`] (?:AS (?:'((?:.*?[^\\\\])?)'|(0x[0-9A-Fa-f]+)) )?REQUIRE ([^ ]*)")
 		if m := re.FindStringSubmatch(createUserStmt); len(m) == 7 {
 			d.Set("user", m[1])
