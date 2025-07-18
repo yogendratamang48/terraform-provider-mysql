@@ -38,7 +38,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsConfig "github.com/aws/aws-sdk-go-v2/config"
 	awsCredentials "github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	awsRdsAuth "github.com/aws/aws-sdk-go-v2/feature/rds/auth"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 const (
@@ -228,6 +230,17 @@ func Provider() *schema.Provider {
 							Type:     schema.TypeString,
 							Optional: true,
 						},
+						"role_arn": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "ARN of the IAM role to assume for AWS RDS IAM authentication",
+						},
+						"aws_rds_iam_auth": {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							Default:     false,
+							Description: "Enable AWS RDS IAM authentication. When enabled, password is ignored and auth token is generated automatically.",
+						},
 					},
 				},
 			},
@@ -324,7 +337,31 @@ func buildAwsConfig(ctx context.Context, awsConfigBlock []interface{}) (aws.Conf
 			awsCredentials.NewStaticCredentialsProvider(config["access_key"].(string), config["secret_key"].(string), ""),
 		))
 	}
-	return awsConfig.LoadDefaultConfig(ctx, optFns...)
+
+	// Load the base config first
+	baseConfig, err := awsConfig.LoadDefaultConfig(ctx, optFns...)
+	if err != nil {
+		return aws.Config{}, fmt.Errorf("failed to load base AWS config: %v", err)
+	}
+
+	// If role_arn is specified, use STS to assume the role
+	if config["role_arn"].(string) != "" {
+		roleArn := config["role_arn"].(string)
+
+		// Create STS client to assume role
+		stsClient := sts.NewFromConfig(baseConfig)
+
+		// Create credentials provider that assumes the role
+		assumeRoleProvider := stscreds.NewAssumeRoleProvider(stsClient, roleArn)
+
+		// Return new config with assume role credentials
+		return awsConfig.LoadDefaultConfig(ctx,
+			awsConfig.WithCredentialsProvider(assumeRoleProvider),
+			awsConfig.WithRegion(baseConfig.Region),
+		)
+	}
+
+	return baseConfig, nil
 }
 
 func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
@@ -340,6 +377,19 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	var tlsConfig = d.Get("tls").(string)
 	var tlsConfigStruct *tls.Config
 	configKey := "default"
+
+	// Read aws_rds_iam_auth from aws_config block
+	var awsRdsIamAuth bool
+	awsConfigBlock := d.Get("aws_config").([]interface{})
+	if len(awsConfigBlock) > 0 && awsConfigBlock[0] != nil {
+		config := awsConfigBlock[0].(map[string]interface{})
+		awsRdsIamAuth = config["aws_rds_iam_auth"].(bool)
+	}
+
+	// Validate: password must be empty when using AWS RDS IAM auth
+	if awsRdsIamAuth && password != "" {
+		return nil, diag.Errorf("password must be empty when aws_rds_iam_auth is enabled in aws_config")
+	}
 
 	customTLSMap := d.Get("custom_tls").([]interface{})
 	if len(customTLSMap) > 0 {
@@ -406,27 +456,34 @@ func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}
 	proto := "tcp"
 	if len(endpoint) > 0 && endpoint[0] == '/' {
 		proto = "unix"
-	} else if strings.HasPrefix(endpoint, "aws://") {
+	} else if awsRdsIamAuth || strings.HasPrefix(endpoint, "aws://") {
+		// AWS RDS IAM authentication (both new and legacy)
 		log.Printf("[DEBUG] Using AWS RDS IAM authentication")
 
+		if strings.HasPrefix(endpoint, "aws://") {
+			endpoint = strings.TrimPrefix(endpoint, "aws://")
+		}
+
+		// Configure for cleartext authentication (required for AWS RDS IAM)
 		allowClearTextPasswords = true
-		endpoint = strings.TrimPrefix(endpoint, "aws://")
 
-		awsConfigBlock := d.Get("aws_config").([]interface{})
+		// Add default port if not specified
+		if !strings.Contains(endpoint, ":") {
+			endpoint = endpoint + ":3306"
+		}
 
+		// Build AWS configuration
 		awsConfigObj, err := buildAwsConfig(ctx, awsConfigBlock)
 		if err != nil {
 			return nil, diag.Errorf("failed to build AWS config: %v", err)
 		}
 
-		if !strings.Contains(endpoint, ":") {
-			endpoint = endpoint + ":3306"
-		}
-
+		// Generate AWS RDS IAM auth token
 		password, err = awsRdsAuth.BuildAuthToken(ctx, endpoint, awsConfigObj.Region, username, awsConfigObj.Credentials)
 		if err != nil {
 			return nil, diag.Errorf("failed to build AWS RDS auth token: %v", err)
 		}
+
 	} else if strings.HasPrefix(endpoint, "cloudsql://") {
 		proto = "cloudsql"
 		endpoint = strings.ReplaceAll(endpoint, "cloudsql://", "")
